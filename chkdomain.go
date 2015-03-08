@@ -8,13 +8,18 @@ import (
 	"strings"
 )
 
-func whois(domain string) (string, error) {
+type WhoisResult struct {
+	domain string
+	output string
+}
+
+func whois(domain string) (WhoisResult, error) {
 	segments := strings.Split(domain, ".")
 	tld := segments[len(segments)-1]
 	server := tld + ".whois-servers.net:43"
 	conn, err := net.Dial("tcp", server)
 	if err != nil {
-		return "", err
+		return WhoisResult{}, err
 	}
 	conn.Write([]byte(domain + "\r\n"))
 	buf := make([]byte, 1024)
@@ -28,7 +33,7 @@ func whois(domain string) (string, error) {
 		}
 	}
 	conn.Close()
-	return string(res), nil
+	return WhoisResult{domain: domain, output: string(res)}, nil
 }
 
 var availableRE = regexp.MustCompile(`\b(is not registered|is available|no match for)\b`)
@@ -45,12 +50,12 @@ func main() {
 	domainRE := regexp.MustCompile(`^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.[a-zA-Z]{2,}$`)
 	for _, domain := range os.Args[1:] {
 		if domainRE.MatchString(domain) {
-			output, err := whois(domain)
+			res, err := whois(domain)
 			if err != nil {
 				fmt.Printf("error [%s]: %s", domain, err)
 			} else {
 				msg := "IS"
-				if isAvailable(output) {
+				if isAvailable(res.output) {
 					msg += " AVAILABLE"
 				} else {
 					msg += " NOT AVAILABLE"

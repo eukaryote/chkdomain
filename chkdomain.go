@@ -3,8 +3,10 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
@@ -25,7 +27,6 @@ type Result struct {
 var (
 	availableRE = regexp.MustCompile(`\b(is not registered|is available|no match for|not found)\b`)
 	domainRE    = regexp.MustCompile(`^[a-zA-Z0-9](?:[a-zA-Z0-9-\.]{0,61}[a-zA-Z0-9])?\.[a-zA-Z]{2,}$`)
-	workers     = 32
 )
 
 func minimum(x, y int) int {
@@ -64,12 +65,18 @@ func (job Job) Run() {
 			result.err = err
 			return
 		}
-		defer conn.Close()
-		conn.Write([]byte(domain + "\r\n"))
+		_, werr := conn.Write([]byte(domain + "\r\n"))
+		if werr != nil {
+			fmt.Printf("Write error: %s\n", werr)
+		}
 		buf := make([]byte, 1024)
 		res := []byte{}
 		for {
 			numbytes, err := conn.Read(buf)
+			if numbytes == 0 && err != io.EOF {
+				result.err = err
+				break
+			}
 			sbuf := buf[0:numbytes]
 			res = append(res, sbuf...)
 			if err != nil {
@@ -78,6 +85,7 @@ func (job Job) Run() {
 		}
 		result.output = string(res)
 		result.available = isDomainAvailable(result.output)
+		conn.Close()
 	}
 	job.results <- result
 }
@@ -96,7 +104,7 @@ func runJobs(done chan<- struct{}, jobs <-chan Job) {
 	done <- struct{}{}
 }
 
-func waitJobs(done <-chan struct{}, results chan Result) {
+func waitJobs(done <-chan struct{}, results chan Result, workers int) {
 	for i := 0; i < workers; i++ {
 		<-done
 	}
@@ -106,29 +114,31 @@ func waitJobs(done <-chan struct{}, results chan Result) {
 func processResults(results <-chan Result) {
 	for result := range results {
 		if result.err != nil {
-			fmt.Printf("'%s' error: %s\n", result.domain, result.err)
-		} else {
-			msg := result.domain
-			if result.available {
-				msg += " IS AVAILABLE"
-			} else {
-				msg += " IS NOT AVAILABLE"
-			}
-			fmt.Println(msg)
+			fmt.Printf("%s: %s\n", result.domain, result.err)
+		} else if result.available {
+			fmt.Println(result.domain)
 		}
 	}
 }
 
+func usage(status int) {
+	fmt.Printf("usage: %s [-h] DOMAIN [DOMAIN]*\n",
+		filepath.Base(os.Args[0]))
+	os.Exit(status)
+}
+
 func main() {
-	runtime.GOMAXPROCS(workers)
-	if len(os.Args) == 1 || os.Args[1] == "-h" || os.Args[1] == "--help" {
-		fmt.Printf("usage: %s DOMAIN ...\n", os.Args[0])
-		os.Exit(1)
+	if len(os.Args) == 1 {
+		usage(1)
+	} else if os.Args[1] == "-h" || os.Args[1] == "--help" {
+		usage(0)
 	}
 	domains := os.Args[1:]
+	workers := minimum(100, len(domains))
+	runtime.GOMAXPROCS(workers)
 
 	jobs := make(chan Job, workers)
-	results := make(chan Result, minimum(100, len(domains)))
+	results := make(chan Result, workers)
 	done := make(chan struct{}, workers)
 
 	go mkJobs(jobs, domains, results)
@@ -136,6 +146,6 @@ func main() {
 	for i := 0; i < workers; i++ {
 		go runJobs(done, jobs)
 	}
-	go waitJobs(done, results)
+	go waitJobs(done, results, workers)
 	processResults(results)
 }

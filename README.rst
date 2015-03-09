@@ -18,6 +18,8 @@ you can install it with::
 Example
 -------
 
+An example that checks four domain names::
+
     $ chkdomain tlon.com uqbar.io kjczr.com google.com
     kjczr.com
     uqbar.io

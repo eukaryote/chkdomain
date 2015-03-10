@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -124,7 +125,26 @@ func processResults(results <-chan Result) {
 func usage(status int) {
 	fmt.Printf("usage: %s [-h] DOMAIN [DOMAIN]*\n",
 		filepath.Base(os.Args[0]))
+	fmt.Printf("If a single '-' param is given, domains will be read ")
+	fmt.Printf("from stdin, one domain per line.\n")
 	os.Exit(status)
+}
+
+func readLines() ([]string, error) {
+	bio := bufio.NewReader(os.Stdin)
+	lines := make([]string, 0, 8)
+	for {
+		line, err := bio.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			} else {
+				return lines, err
+			}
+		}
+		lines = append(lines, line[:len(line)-1])
+	}
+	return lines, nil
 }
 
 func main() {
@@ -134,6 +154,14 @@ func main() {
 		usage(0)
 	}
 	domains := os.Args[1:]
+	if len(domains) == 1 && domains[0] == "-" {
+		fileDomains, err := readLines()
+		if err != nil {
+			fmt.Printf("error reading domains from stdin: %s\n", err)
+			os.Exit(1)
+		}
+		domains = fileDomains
+	}
 	workers := minimum(100, len(domains))
 	runtime.GOMAXPROCS(workers)
 

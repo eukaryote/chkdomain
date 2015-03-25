@@ -30,7 +30,7 @@ var (
 	domainRE    = regexp.MustCompile(`^[a-zA-Z0-9](?:[a-zA-Z0-9-\.]{0,61}[a-zA-Z0-9])?\.[a-zA-Z]{2,}$`)
 )
 
-func minimum(x, y int) int {
+func minInt(x, y int) int {
 	if y < x {
 		return y
 	} else {
@@ -55,43 +55,46 @@ func getWhoisServer(domain string) string {
 	return tld + ".whois-servers.net:43"
 }
 
-func (job Job) Run() {
-	domain := job.domain
-	result := Result{domain: domain}
+func whois(domain string) (string, error) {
 	if !isDomainValid(domain) {
-		result.err = errors.New("invalid domain")
+		return "", errors.New(fmt.Sprintf("invalid domain: %s", domain))
+	}
+	whoisServer := getWhoisServer(domain)
+	if conn, connErr := net.Dial("tcp", whoisServer); connErr != nil {
+		msg := fmt.Sprint("error connecting to %v: %v", whoisServer, connErr)
+		return "", errors.New(msg)
 	} else {
-		conn, err := net.Dial("tcp", getWhoisServer(domain))
-		if err != nil {
-			result.err = err
-			return
-		}
-		_, werr := conn.Write([]byte(domain + "\r\n"))
-		if werr != nil {
-			fmt.Printf("Write error: %s\n", werr)
+		if _, wrtErr := conn.Write([]byte(domain + "\r\n")); wrtErr != nil {
+			return "", wrtErr
 		}
 		buf := make([]byte, 1024)
 		res := []byte{}
 		for {
-			numbytes, err := conn.Read(buf)
-			if numbytes == 0 && err != io.EOF {
-				result.err = err
-				break
-			}
-			sbuf := buf[0:numbytes]
-			res = append(res, sbuf...)
-			if err != nil {
-				break
+			if numBytes, readErr := conn.Read(buf); numBytes == 0 && readErr != io.EOF {
+				return "", readErr
+			} else {
+				res = append(res, buf[0:numBytes]...)
+				if readErr == io.EOF {
+					break
+				}
 			}
 		}
-		result.output = string(res)
-		result.available = isDomainAvailable(result.output)
-		conn.Close()
+		return string(res), nil
+	}
+}
+
+func (job Job) Run() {
+	result := Result{domain: job.domain}
+	if whoisOutput, err := whois(result.domain); err != nil {
+		result.err = err
+	} else {
+		result.output = whoisOutput
+		result.available = isDomainAvailable(whoisOutput)
 	}
 	job.results <- result
 }
 
-func mkJobs(jobs chan<- Job, domains []string, results chan<- Result) {
+func makeJobs(jobs chan<- Job, domains []string, results chan<- Result) {
 	for _, domain := range domains {
 		jobs <- Job{domain, results}
 	}
@@ -162,14 +165,14 @@ func main() {
 		}
 		domains = fileDomains
 	}
-	workers := minimum(100, len(domains))
+	workers := minInt(100, len(domains))
 	runtime.GOMAXPROCS(workers)
 
 	jobs := make(chan Job, workers)
 	results := make(chan Result, workers)
 	done := make(chan struct{}, workers)
 
-	go mkJobs(jobs, domains, results)
+	go makeJobs(jobs, domains, results)
 
 	for i := 0; i < workers; i++ {
 		go runJobs(done, jobs)

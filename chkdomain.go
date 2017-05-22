@@ -183,15 +183,13 @@ func main() {
 		usage(1)
 	}
 
-	// Show usage and exit successfully if any standard help flag is given.
-	for _, arg := range os.Args {
-		if arg == "-h" || arg == "-help" || arg == "--help" {
-			usage(0)
-		}
-	}
-
 	debug := flag.Bool("debug", false, "print debug info (all results, with times)")
+	help := flag.Bool("help", false, "show usage info")
 	flag.Parse()
+
+	if *help {
+		usage(0)
+	}
 
 	domains := flag.Args()
 	numDomains := len(domains)

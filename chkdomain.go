@@ -39,7 +39,7 @@ type Job struct {
 	results chan<- Result
 }
 
-// Run job and send result to 'Job.results'.
+// Run job and send result to 'results' channel.
 func (job Job) Run() {
 	result := Result{domain: job.domain}
 	if whoisOutput, err := whois(result.domain); err != nil {
@@ -193,6 +193,7 @@ func main() {
 			os.Exit(1)
 		}
 		domains = fileDomains
+		numDomains = len(domains)
 	}
 
 	jobs := make(chan Job, numDomains)

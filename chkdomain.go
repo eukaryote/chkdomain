@@ -10,7 +10,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -102,14 +101,6 @@ func whois(domain string) (string, error) {
 	}
 }
 
-// Create jobs (without starting them) and send to jobs channel and close it.
-func makeJobs(jobs chan<- Job, domains []string, results chan<- Result) {
-	for _, domain := range domains {
-		jobs <- Job{domain, results}
-	}
-	close(jobs)
-}
-
 // Process results as they are ready, closing 'done' after all expected
 // results have been processed (based on numDomains).
 func processResults(results chan Result, numDomains int, done chan struct{}, debug bool) {
@@ -141,15 +132,6 @@ func processResults(results chan Result, numDomains int, done chan struct{}, deb
 	}
 }
 
-func usage(status int) {
-	fmt.Printf("usage: %s [-h] DOMAIN [DOMAIN]*\n\n",
-		filepath.Base(os.Args[0]))
-	fmt.Printf("If a single '-' param is given, domains will be read ")
-	fmt.Printf("from stdin, one domain per line.\n\n")
-	fmt.Printf("Domain names that are available will be printed to stdout.\n")
-	os.Exit(status)
-}
-
 func readLines() ([]string, error) {
 	bio := bufio.NewReader(os.Stdin)
 	lines := make([]string, 0, 8)
@@ -168,17 +150,20 @@ func readLines() ([]string, error) {
 }
 
 func main() {
-	// At least 1 arg is required, so print usage and fail if none given.
-	if len(os.Args) < 2 {
-		usage(1)
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: chkdomain [options] <DOMAIN> [DOMAIN...]\n\n")
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\n  DOMAIN domain name to check, or - to read from stdin (one per line)")
+		os.Exit(1)
 	}
 
 	debug := flag.Bool("debug", false, "print debug info (all results, with times)")
-	help := flag.Bool("help", false, "show usage info")
 	flag.Parse()
 
-	if *help {
-		usage(0)
+	// At least 1 arg is required, so print usage and fail if none given.
+	if len(os.Args) < 2 {
+		flag.Usage()
 	}
 
 	domains := flag.Args()
@@ -196,17 +181,14 @@ func main() {
 		numDomains = len(domains)
 	}
 
-	jobs := make(chan Job, numDomains)
 	results := make(chan Result, numDomains)
 	done := make(chan struct{})
 
-	// Make jobs, which prepares a job for a single domain and will
-	// send the result to 'job.results' when done
-	go makeJobs(jobs, domains, results)
-	// Start all jobs running
-	for job := range jobs {
-		go job.Run()
+	// Run all jobs concurrently
+	for _, domain := range domains {
+		go Job{domain, results}.Run()
 	}
+
 	// Process results, waiting on 'done' to be closed after all
 	// expected results have been processed.
 	go processResults(results, numDomains, done, *debug)

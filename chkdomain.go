@@ -102,7 +102,7 @@ func whois(domain string) (string, error) {
 	}
 }
 
-// Create jobs (without starting them).
+// Create jobs (without starting them) and send to jobs channel and close it.
 func makeJobs(jobs chan<- Job, domains []string, results chan<- Result) {
 	for _, domain := range domains {
 		jobs <- Job{domain, results}
@@ -110,27 +110,14 @@ func makeJobs(jobs chan<- Job, domains []string, results chan<- Result) {
 	close(jobs)
 }
 
-// Start all jobs running.
-func runJobs(done chan<- struct{}, jobs <-chan Job) {
-	for job := range jobs {
-		job.Run()
-	}
-	done <- struct{}{}
-}
-
-// Wait for all jobs to complete.
-func waitJobs(done <-chan struct{}, results chan Result, workers int) {
-	for i := 0; i < workers; i++ {
-		<-done
-	}
-	close(results)
-}
-
-// Process results as they are ready.
-func processResults(results <-chan Result, debug bool) {
+// Process results as they are ready, closing 'done' after all expected
+// results have been processed (based on numDomains).
+func processResults(results chan Result, numDomains int, done chan struct{}, debug bool) {
+	processed := 0
 	for result := range results {
+		processed += 1
 		if result.err != nil {
-			fmt.Printf("%s: %s\n", result.domain, result.err)
+			fmt.Printf("%s\n", result.err)
 			continue
 		}
 		if debug {
@@ -147,7 +134,10 @@ func processResults(results <-chan Result, debug bool) {
 				fmt.Println(result.domain)
 			}
 		}
-
+		if processed >= numDomains {
+			close(done)
+			return
+		}
 	}
 }
 
@@ -205,17 +195,19 @@ func main() {
 		domains = fileDomains
 	}
 
-	// Prepare jobs and then start them all running and wait for results
-	// before printing results to stdout.
 	jobs := make(chan Job, numDomains)
 	results := make(chan Result, numDomains)
-	done := make(chan struct{}, numDomains)
+	done := make(chan struct{})
 
+	// Make jobs, which prepares a job for a single domain and will
+	// send the result to 'job.results' when done
 	go makeJobs(jobs, domains, results)
-
-	for i := 0; i < numDomains; i++ {
-		go runJobs(done, jobs)
+	// Start all jobs running
+	for job := range jobs {
+		go job.Run()
 	}
-	go waitJobs(done, results, numDomains)
-	processResults(results, *debug)
+	// Process results, waiting on 'done' to be closed after all
+	// expected results have been processed.
+	go processResults(results, numDomains, done, *debug)
+	<-done
 }

@@ -1,23 +1,31 @@
+// chkdomain runs whois lookups against one or more domain names and prints
+// those that are available to stdout.
 package main
 
 import (
 	"bufio"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
+	"time"
 )
 
-type Job struct {
-	domain  string
-	results chan<- Result
-}
+var (
+	// Regex for detecting whois response indicating domain is available
+	availableRE = regexp.MustCompile(`\b(is not registered|is available|no match for|not found)\b`)
+	// Regex for validating a domain, to prevent things like '--foo' from being queried
+	domainRE = regexp.MustCompile(`^[a-zA-Z0-9](?:[a-zA-Z0-9-\.]{0,61}[a-zA-Z0-9])?\.[a-zA-Z]{2,}$`)
+	// Time in ms past epoch when program started
+	startMS = time.Now().UnixNano() / int64(time.Millisecond)
+)
 
+// The result of a whois check for a single domain.
 type Result struct {
 	domain    string
 	output    string
@@ -25,27 +33,35 @@ type Result struct {
 	err       error
 }
 
-var (
-	availableRE = regexp.MustCompile(`\b(is not registered|is available|no match for|not found)\b`)
-	domainRE    = regexp.MustCompile(`^[a-zA-Z0-9](?:[a-zA-Z0-9-\.]{0,61}[a-zA-Z0-9])?\.[a-zA-Z]{2,}$`)
-)
-
-func minInt(x, y int) int {
-	if y < x {
-		return y
-	} else {
-		return x
-	}
+// A currently running job to lookup info for a single domain.
+type Job struct {
+	domain  string
+	results chan<- Result
 }
 
+// Run job and send result to 'Job.results'.
+func (job Job) Run() {
+	result := Result{domain: job.domain}
+	if whoisOutput, err := whois(result.domain); err != nil {
+		result.err = err
+	} else {
+		result.output = whoisOutput
+		result.available = isDomainAvailable(whoisOutput)
+	}
+	job.results <- result
+}
+
+// Answer whether domain appears to be available based on whois text result.
 func isDomainAvailable(whoisText string) bool {
 	return availableRE.FindString(strings.ToLower(whoisText)) != ""
 }
 
+// Answer whether domain is valid by validating against domainRE regex.
 func isDomainValid(domain string) bool {
 	return !!domainRE.MatchString(domain)
 }
 
+// Get the whois server (including port) for querying a given domain.
 func getWhoisServer(domain string) string {
 	segments := strings.Split(domain, ".")
 	tld := segments[len(segments)-1]
@@ -55,6 +71,9 @@ func getWhoisServer(domain string) string {
 	return tld + ".whois-servers.net:43"
 }
 
+// Run a whois check for the given domain, returning the non-empty string
+// result of the lookup (and nil) on success, or an empty string and error
+// on failure.
 func whois(domain string) (string, error) {
 	if !isDomainValid(domain) {
 		return "", errors.New(fmt.Sprintf("invalid domain: %s", domain))
@@ -83,17 +102,7 @@ func whois(domain string) (string, error) {
 	}
 }
 
-func (job Job) Run() {
-	result := Result{domain: job.domain}
-	if whoisOutput, err := whois(result.domain); err != nil {
-		result.err = err
-	} else {
-		result.output = whoisOutput
-		result.available = isDomainAvailable(whoisOutput)
-	}
-	job.results <- result
-}
-
+// Create jobs (without starting them).
 func makeJobs(jobs chan<- Job, domains []string, results chan<- Result) {
 	for _, domain := range domains {
 		jobs <- Job{domain, results}
@@ -101,6 +110,7 @@ func makeJobs(jobs chan<- Job, domains []string, results chan<- Result) {
 	close(jobs)
 }
 
+// Start all jobs running.
 func runJobs(done chan<- struct{}, jobs <-chan Job) {
 	for job := range jobs {
 		job.Run()
@@ -108,6 +118,7 @@ func runJobs(done chan<- struct{}, jobs <-chan Job) {
 	done <- struct{}{}
 }
 
+// Wait for all jobs to complete.
 func waitJobs(done <-chan struct{}, results chan Result, workers int) {
 	for i := 0; i < workers; i++ {
 		<-done
@@ -115,21 +126,37 @@ func waitJobs(done <-chan struct{}, results chan Result, workers int) {
 	close(results)
 }
 
-func processResults(results <-chan Result) {
+// Process results as they are ready.
+func processResults(results <-chan Result, debug bool) {
 	for result := range results {
 		if result.err != nil {
 			fmt.Printf("%s: %s\n", result.domain, result.err)
-		} else if result.available {
-			fmt.Println(result.domain)
+			continue
 		}
+		if debug {
+			fmt.Printf("[%d]\t", (time.Now().UnixNano()/int64(time.Millisecond))-startMS)
+		}
+		if result.available {
+			if debug {
+				fmt.Printf("AVAILABLE\t")
+			}
+			fmt.Println(result.domain)
+		} else {
+			if debug {
+				fmt.Printf("UNAVAILABLE\t")
+				fmt.Println(result.domain)
+			}
+		}
+
 	}
 }
 
 func usage(status int) {
-	fmt.Printf("usage: %s [-h] DOMAIN [DOMAIN]*\n",
+	fmt.Printf("usage: %s [-h] DOMAIN [DOMAIN]*\n\n",
 		filepath.Base(os.Args[0]))
 	fmt.Printf("If a single '-' param is given, domains will be read ")
-	fmt.Printf("from stdin, one domain per line.\n")
+	fmt.Printf("from stdin, one domain per line.\n\n")
+	fmt.Printf("Domain names that are available will be printed to stdout.\n")
 	os.Exit(status)
 }
 
@@ -151,13 +178,27 @@ func readLines() ([]string, error) {
 }
 
 func main() {
-	if len(os.Args) == 1 {
+	// At least 1 arg is required, so print usage and fail if none given.
+	if len(os.Args) < 2 {
 		usage(1)
-	} else if os.Args[1] == "-h" || os.Args[1] == "--help" {
-		usage(0)
 	}
-	domains := os.Args[1:]
-	if len(domains) == 1 && domains[0] == "-" {
+
+	// Show usage and exit successfully if any standard help flag is given.
+	for _, arg := range os.Args {
+		if arg == "-h" || arg == "-help" || arg == "--help" {
+			usage(0)
+		}
+	}
+
+	debug := flag.Bool("debug", false, "print debug info (all results, with times)")
+	flag.Parse()
+
+	domains := flag.Args()
+	numDomains := len(domains)
+
+	// If there's just one arg, check if it's '-' to indicate that
+	// domains will be provided one-per-line via stdin, and read them if so.
+	if numDomains == 1 && domains[0] == "-" {
 		fileDomains, err := readLines()
 		if err != nil {
 			fmt.Printf("error reading domains from stdin: %s\n", err)
@@ -165,18 +206,18 @@ func main() {
 		}
 		domains = fileDomains
 	}
-	workers := minInt(100, len(domains))
-	runtime.GOMAXPROCS(workers)
 
-	jobs := make(chan Job, workers)
-	results := make(chan Result, workers)
-	done := make(chan struct{}, workers)
+	// Prepare jobs and then start them all running and wait for results
+	// before printing results to stdout.
+	jobs := make(chan Job, numDomains)
+	results := make(chan Result, numDomains)
+	done := make(chan struct{}, numDomains)
 
 	go makeJobs(jobs, domains, results)
 
-	for i := 0; i < workers; i++ {
+	for i := 0; i < numDomains; i++ {
 		go runJobs(done, jobs)
 	}
-	go waitJobs(done, results, workers)
-	processResults(results)
+	go waitJobs(done, results, numDomains)
+	processResults(results, *debug)
 }

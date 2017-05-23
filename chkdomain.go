@@ -4,7 +4,6 @@ package main
 
 import (
 	"bufio"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -30,6 +29,28 @@ type Result struct {
 	output    string
 	available bool
 	err       error
+}
+
+// Print result of a whois check, optionally including extra debug info.
+func (result Result) Print(debug bool) {
+	if result.err != nil {
+		fmt.Printf("%s\n", result.err)
+		return
+	}
+	if debug {
+		fmt.Printf("[%d]\t", (time.Now().UnixNano()/int64(time.Millisecond))-startMS)
+	}
+	if result.available {
+		if debug {
+			fmt.Printf("AVAILABLE\t")
+		}
+		fmt.Println(result.domain)
+	} else {
+		if debug {
+			fmt.Printf("UNAVAILABLE\t")
+			fmt.Println(result.domain)
+		}
+	}
 }
 
 // A currently running job to lookup info for a single domain.
@@ -70,87 +91,63 @@ func getWhoisServer(domain string) string {
 	return tld + ".whois-servers.net:43"
 }
 
-// Run a whois check for the given domain, returning the non-empty string
-// result of the lookup (and nil) on success, or an empty string and error
-// on failure.
+// Run a whois check for the given domain, returning a non-empty string result
+// of the lookup (and nil) on success, or an empty string and error on failure.
 func whois(domain string) (string, error) {
 	if !isDomainValid(domain) {
-		return "", errors.New(fmt.Sprintf("invalid domain: %s", domain))
+		return "", fmt.Errorf("invalid domain: %s", domain)
 	}
 	whoisServer := getWhoisServer(domain)
-	if conn, connErr := net.Dial("tcp", whoisServer); connErr != nil {
-		msg := fmt.Sprint("error connecting to %v: %v", whoisServer, connErr)
-		return "", errors.New(msg)
-	} else {
-		if _, wrtErr := conn.Write([]byte(domain + "\r\n")); wrtErr != nil {
-			return "", wrtErr
-		}
-		buf := make([]byte, 1024)
-		res := []byte{}
-		for {
-			if numBytes, readErr := conn.Read(buf); numBytes == 0 && readErr != io.EOF {
-				return "", readErr
-			} else {
-				res = append(res, buf[0:numBytes]...)
-				if readErr == io.EOF {
-					break
-				}
-			}
-		}
-		return string(res), nil
-	}
-}
 
-// Process results as they are ready, closing 'done' after all expected
-// results have been processed (based on numDomains).
-func processResults(results chan Result, numDomains int, done chan struct{}, debug bool) {
-	processed := 0
-	for result := range results {
-		processed += 1
-		if result.err != nil {
-			fmt.Printf("%s\n", result.err)
-			continue
+	conn, connErr := net.Dial("tcp4", whoisServer)
+	if connErr != nil {
+		return "", fmt.Errorf("error connecting to %v: %v", whoisServer, connErr)
+	}
+
+	_, wrtErr := conn.Write([]byte(domain + "\r\n"))
+	if wrtErr != nil {
+		return "", fmt.Errorf("error writing to socket: %v", wrtErr)
+	}
+
+	buf := make([]byte, 1024)
+	res := []byte{}
+	for {
+		numBytes, readErr := conn.Read(buf)
+		if numBytes == 0 && readErr != io.EOF {
+			return "", readErr
 		}
-		if debug {
-			fmt.Printf("[%d]\t", (time.Now().UnixNano()/int64(time.Millisecond))-startMS)
-		}
-		if result.available {
-			if debug {
-				fmt.Printf("AVAILABLE\t")
-			}
-			fmt.Println(result.domain)
-		} else {
-			if debug {
-				fmt.Printf("UNAVAILABLE\t")
-				fmt.Println(result.domain)
-			}
-		}
-		if processed >= numDomains {
-			close(done)
-			return
+		res = append(res, buf[0:numBytes]...)
+		if readErr == io.EOF {
+			break
 		}
 	}
+	return string(res), nil
 }
 
-func readLines() ([]string, error) {
+// Read whitespace-delimited words from stdin and split on space and/or newline,
+// returning ([]string, nil) on success or ("", error) on failure.
+func readWords() ([]string, error) {
 	bio := bufio.NewReader(os.Stdin)
-	lines := make([]string, 0, 8)
+	lines := make([]string, 0, 16)
 	for {
 		line, err := bio.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				break
-			} else {
-				return lines, err
+		if err != nil && err != io.EOF {
+			return lines, err
+		}
+		for _, word := range strings.Split(strings.TrimRight(line, "\n"), " ") {
+			word = strings.Trim(word, " ")
+			if word != "" {
+				lines = append(lines, word)
 			}
 		}
-		lines = append(lines, line[:len(line)-1])
+		if err == io.EOF {
+			break
+		}
 	}
 	return lines, nil
 }
 
 func main() {
-
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: chkdomain [options] <DOMAIN> [DOMAIN...]\n\n")
 		flag.PrintDefaults()
@@ -172,25 +169,27 @@ func main() {
 	// If there's just one arg, check if it's '-' to indicate that
 	// domains will be provided one-per-line via stdin, and read them if so.
 	if numDomains == 1 && domains[0] == "-" {
-		fileDomains, err := readLines()
+		fileDomains, err := readWords()
 		if err != nil {
-			fmt.Printf("error reading domains from stdin: %s\n", err)
+			fmt.Fprintf(os.Stderr, "error reading domains from stdin: %v", err)
 			os.Exit(1)
 		}
 		domains = fileDomains
 		numDomains = len(domains)
 	}
 
+	// Results channel to which each job doing the lookup in a goroutine
+	// will send its result upon completion
 	results := make(chan Result, numDomains)
-	done := make(chan struct{})
 
-	// Run all jobs concurrently
+	// Start all coroutines
 	for _, domain := range domains {
 		go Job{domain, results}.Run()
 	}
 
-	// Process results, waiting on 'done' to be closed after all
-	// expected results have been processed.
-	go processResults(results, numDomains, done, *debug)
-	<-done
+	// Handle result of each as it is available
+	for _ = range domains {
+		result := <-results
+		result.Print(*debug)
+	}
 }
